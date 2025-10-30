@@ -1,0 +1,220 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>WebRTC 1-1 Audio (with TURN)</title>
+    <style>
+        body {
+            font-family: system-ui, Arial;
+            padding: 20px;
+            max-width: 720px;
+            margin: auto;
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+        }
+
+        button {
+            padding: 8px 12px;
+        }
+
+        #log {
+            white-space: pre-wrap;
+            background: #f7f7f7;
+            padding: 8px;
+            height: 200px;
+            overflow: auto;
+            border: 1px solid #ddd;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Demo WebRTC 1-1 Audio (TURN-ready)</h1>
+
+    <div>
+        <label>Room ID: <input id="roomId" value="room1"></label>
+        <button id="joinBtn">Join Room</button>
+        <button id="hangupBtn" disabled>Hang up</button>
+    </div>
+
+    <div class="controls">
+        <label>
+            <input type="checkbox" id="useMic" checked> Enable microphone
+        </label>
+        <label>
+            <input type="checkbox" id="isCaller"> I will call (create offer)
+        </label>
+    </div>
+
+    <h3>Local audio</h3>
+    <audio id="localAudio" autoplay muted></audio>
+
+    <h3>Remote audio</h3>
+    <audio id="remoteAudio" autoplay></audio>
+
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <script>
+        const logEl = document.getElementById('log');
+        function log(...args) { logEl.textContent += args.join(' ') + '\\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+        let pc = null;
+        let localStream = null;
+        let ws = null;
+        let joined = false;
+
+        const localAudio = document.getElementById('localAudio');
+        const remoteAudio = document.getElementById('remoteAudio');
+
+        const joinBtn = document.getElementById('joinBtn');
+        const hangupBtn = document.getElementById('hangupBtn');
+
+        joinBtn.onclick = async () => {
+            if (joined) return;
+            const room = document.getElementById('roomId').value.trim();
+            if (!room) return alert('Enter room id');
+
+            // open websocket to signaling server
+            ws = new WebSocket('wss://' + location.hostname + ':443'); // if signaling server on same host; change URL if different
+            ws.onopen = () => {
+                ws.send(JSON.stringify({ type: 'join', room }));
+                log('WebSocket connected, joined', room);
+            };
+            ws.onmessage = async (evt) => {
+                const msg = JSON.parse(evt.data);
+                log('WS in:', msg.type);
+                if (msg.type === 'joined') {
+                    joined = true;
+                    joinBtn.disabled = true;
+                    hangupBtn.disabled = false;
+                    // get media
+                    if (document.getElementById('useMic').checked) {
+                        try {
+                            localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                            localAudio.srcObject = localStream;
+                        } catch (e) {
+                            log('getUserMedia error', e.toString());
+                            return;
+                        }
+                    }
+
+                    createPeerConnection();
+
+                    // if user chose "I will call", create offer
+                    if (document.getElementById('isCaller').checked) {
+                        await doOffer();
+                    }
+                } else if (msg.type === 'offer') {
+                    log('Received offer');
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    ws.send(JSON.stringify({ type: 'answer', payload: pc.localDescription }));
+                    log('Sent answer');
+                } else if (msg.type === 'answer') {
+                    log('Received answer');
+                    await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+                } else if (msg.type === 'ice') {
+                    // remote ICE candidate
+                    try {
+                        await pc.addIceCandidate(msg.payload);
+                        log('Added remote ICE candidate');
+                    } catch (e) {
+                        console.warn('addIceCandidate error', e);
+                    }
+                } else if (msg.type === 'peer-left') {
+                    log('Peer left');
+                    // optional: close connection
+                    cleanupPeer();
+                }
+            };
+
+            ws.onclose = () => { log('WebSocket closed'); };
+            ws.onerror = (e) => { console.error(e); log('WebSocket error'); };
+        };
+
+        hangupBtn.onclick = () => {
+            if (ws) ws.close();
+            cleanupPeer();
+            joinBtn.disabled = false;
+            hangupBtn.disabled = true;
+            joined = false;
+        };
+
+        function createPeerConnection() {
+            // Configure ICE servers: STUN + your Coturn TURN
+            const config = {
+                iceServers: [
+                    {
+                        urls: 'turn:162.248.227.133:3478?transport=udp',
+                        username: 'sussybaka',
+                        credential: '1234567890'
+                    },
+                    {
+                        urls: 'turn:162.248.227.133:3478?transport=tcp',
+                        username: 'sussybaka',
+                        credential: '1234567890'
+                    }
+                ],
+                iceCandidatePoolSize: 0,
+            };
+
+            pc = new RTCPeerConnection(config);
+            pc.onicecandidate = (e) => {
+                if (e.candidate && ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'ice', payload: e.candidate }));
+                    log('Sent local ICE candidate');
+                }
+            };
+
+            pc.ontrack = (e) => {
+                log('Remote track received');
+                remoteAudio.srcObject = e.streams[0];
+            };
+
+            pc.onconnectionstatechange = () => {
+                log('PC state:', pc.connectionState);
+                if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                    cleanupPeer();
+                }
+            };
+
+            // add local tracks
+            if (localStream) {
+                for (const t of localStream.getTracks()) pc.addTrack(t, localStream);
+            } else {
+                // if user didn't allow mic, still create datachannel or silent stream — but here we require audio
+            }
+        }
+
+        async function doOffer() {
+            if (!pc) createPeerConnection();
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            // send offer to peer
+            ws.send(JSON.stringify({ type: 'offer', payload: pc.localDescription }));
+            log('Sent offer');
+        }
+
+        function cleanupPeer() {
+            if (pc) {
+                try { pc.close(); } catch (e) { }
+                pc = null;
+            }
+            if (localStream) {
+                for (const t of localStream.getTracks()) t.stop();
+                localStream = null;
+                localAudio.srcObject = null;
+            }
+            remoteAudio.srcObject = null;
+        }
+    </script>
+</body>
+
+</html>
